@@ -1,0 +1,331 @@
+bplist00“_WebMainResource_WebSubresources’	
+_WebResourceData_WebResourceMIMEType_WebResourceTextEncodingName^WebResourceURL_WebResourceFrameNameON<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang=""><head>
+  <meta charset="utf-8">
+  <meta name="generator" content="pandoc">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <meta name="author" content="aib">
+  <meta name="dcterms.date" content="2017-08-29">
+  <title>Hacking the Orange Pi 2G-IOT</title>
+  <style type="text/css">
+      code{white-space: pre-wrap;}
+      span.smallcaps{font-variant: small-caps;}
+      span.underline{text-decoration: underline;}
+      div.column{display: inline-block; vertical-align: top; width: 50%;}
+  </style>
+  <link rel="stylesheet" href="../css/pandoc.css">
+</head>
+<body>
+<header>
+<h1 class="title">Hacking the Orange Pi 2G-IOT</h1>
+<p class="author">aib</p>
+<p class="date">20170829</p>
+</header>
+<p>This article documents my fiddling around with the <a href="http://www.orangepi.org/OrangePi2GIOT/">Orange Pi 2G-IOT</a>. It is also a tutorial where we will build a custom Linux image to run on the on-board NAND flash memory, a custom bootloader to boot it, and then flash them using a custom tool that I wrote.</p>
+<h2 id="the-board">The Board</h2>
+<p>The Orange Pi 2G-IOT is one of a series of single-board computers in the <a href="http://www.orangepi.org/">Orange Pi</a> product line. It has a RDA8810 SoC and, uniquely in the series, 2G GSM connectivity. It was, most likely, originally designed as a phone. In fact, it comes loaded with an Android OS and as far as I can gather, it is a single touchscreen (and maybe a battery) away from being an actual smart phone.</p>
+<p>The board has a micro SD/MMC card slot, a ~512 MiB internal NAND flash memory, and a jumper to select which one to boot off of. While it's easy to write an image to the SD card and boot it, the NAND counterpart is challenging because of the lack of tools, documentation and official images. Hopefully, this article and the accompanying tools remedy some of that.</p>
+<h2 id="installing-gnulinux-on-the-nand">Installing GNU/Linux on the NAND</h2>
+<p>The flash memory is divided into partitions, so our list of basic requirements is:</p>
+<ul class="incremental">
+<li>A Partition Table</li>
+<li>The partition images</li>
+<li>A flashing tool</li>
+</ul>
+<p>We will be using a single small bootloader partition and a single large GNU/Linux system partition. We will be using my own flashing tool along with two required flashing stage binaries, <code>pdl1.bin</code> and <code>pdl2.bin</code>. We will generate the system image by slightly modifying one of the official SD card distributions, the bootloader and the two PDL<a href="#fn1" class="footnoteRef" id="fnref1"><sup>1</sup></a> binaries by building a fork of the bootloader code, and the partition table by hand.</p>
+<h3 id="the-partition-table">The Partition Table</h3>
+<p>Every process involving the NAND starts with the partition table. This table divides the memory into pieces and labels every piece. Here is what the stock Android partition table looks like, in the Linux (kernel) command line parameter format<a href="#fn2" class="footnoteRef" id="fnref2"><sup>2</sup></a>:</p>
+<pre class="literal"><code>mtdparts=rda_nand:2M@128K(bootloader),2M(factorydata),2M(misc),4M(modem),8M(boot),10M(recovery),300M(system),300M(vendor),-(userdata)</code></pre>
+<p>U-Boot also uses this format so it is the only format we will ever need.</p>
+<p>On reboot, the RDA8810 looks for the boot image at address 0<a href="#fn3" class="footnoteRef" id="fnref3"><sup>3</sup></a>. This is where the bootloader will go, and thus it is where we will have the partition called <code>bootloader</code>. We'll round it off to, say, 2 MiB and leave the rest of the memory to our single system partition. Assuming the NAND is 512 MiB<a href="#fn4" class="footnoteRef" id="fnref4"><sup>4</sup></a>, that sould be 510 MiB. Let's call the partition <code>nandroot</code>:</p>
+<pre class="literal"><code>mtdparts=rda_nand:2M(bootloader),510M(nandroot)</code></pre>
+<p>And that's it! Later, we will work this partition table into the bootloader, the PDL2, and the boot scripts.</p>
+<h3 id="the-gnulinux-image">The GNU/Linux Image</h3>
+<p>Creating a filesystem (and/or a filesystem image) to work on NAND flash memory is not straightfoward because the NAND flash is not a random-access block device. Reading is straightforward, but writing requires whole blocks of memory to be erased first. These blocks have finite life so the erasures (and therefore the writes) need to be spread evenly across the device<a href="#fn5" class="footnoteRef" id="fnref5"><sup>5</sup></a>. It is therefore necessary to use technologies designed with these constraints in mind. We will be creating a UBI volume and a UBIFS image<a href="#fn6" class="footnoteRef" id="fnref6"><sup>6</sup></a>.</p>
+<p>We need a working distribution to use as a base image. If you don't have one already, go ahead and set one up. Orange Pi 2G-IOT has official GNU/Linux distributions on the <a href="http://www.orangepi.org/downloadresources/">download page</a>. We will be booting off the MMC and working there. You will need lots of free space on the card (we will be making three copies of (most of) the entire filesystem, only two of them compressed), so use a nonsmall card and expand the root filesystem if necessary.</p>
+<p>Ready?</p>
+<pre class="shell"><code>orangepi@OrangePi:~$ </code></pre>
+<p>Let's create a directory to work from:</p>
+<pre class="shell cmd"><code>mkdir nandfs</code></pre>
+<pre class="shell cmd"><code>cd nandfs</code></pre>
+<p>First, we want a copy of the whole root filesystem, shrunk down to less than the NAND size. I'll leave it up to you to remove the cruft<a href="#fn7" class="footnoteRef" id="fnref7"><sup>7</sup></a> and/or add it to the list of excludes below. I've found that <code>rsync -x</code> is a good way to go about this. In fact, I've written a small shell script:</p>
+<pre class="code" data-filename="mknandfs.sh" data-language="bash"><code>#!/bin/bash
+set -euo pipefail
+set -x
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+SRC="$SCRIPT_DIR"
+DEST_ROOT="$SCRIPT_DIR"/nandroot
+
+rsync -a -x --delete --delete-excluded / /boot "$DEST_ROOT" -f "merge $SRC/cpfs.filter" -v
+cp "$SRC"/fstab "$DEST_ROOT"/etc/fstab</code></pre>
+<p>Note that it uses a filter file called <code>cpfs.filter</code>. This is useful for specifying exclusions; files that we want (or can't be bothered to delete) on the MMC but not the NAND:</p>
+<pre class="file" data-filename="cpfs.filter"><code>+ /home/orangepi/.bash_logout
++ /home/orangepi/.bashrc
++ /home/orangepi/.profile
+- /home/orangepi/**
+
+- /var/backup/**
+- /var/cache/**
+- /var/lib/apt/lists/**
+- /var/log/**
+- /var/tmp/**
+
+- /usr/share/doc/**
+- /usr/share/man/**
+
+- __pycache__
+- *.pyc</code></pre>
+<p>Ignoring the fstab bit for the moment, we have a script capable of creating and updating the NAND root filesystem. Let's test it:</p>
+<pre class="shell cmd"><code>sudo ~/nandfs/mknandfs.sh</code></pre>
+<pre class="shell out" data-ellipsis="..."><code>+++ readlink -f /home/orangepi/nandfs/mknandfs.sh
+++ dirname /home/orangepi/nandfs/mknandfs.sh
++ SCRIPT_DIR=/home/orangepi/nandfs
++ SRC=/home/orangepi/nandfs
++ DEST=/home/orangepi/nandroot
++ DEST_IMG=/home/orangepi/nandroot.img
++ rsync -a -x --delete --delete-excluded / /home/orangepi/nandroot -f 'merge /home/orangepi/nandfs/cpfs.filter' -v
+sending incremental file list
+created directory /home/orangepi/nandroot
+./
+bin/
+bin/bash</code></pre>
+<p>We should have the root filesystem at <code>~/nandfs/nandroot</code>, minus a custom fstab and a custom boot script.</p>
+<p>Let's do fstab first. On my system, <code>/etc/fstab</code> looks like:</p>
+<pre class="file" data-filename="/etc/fstab"><code># OrangePI fstab
+/dev/mmcblk0p2  /  ext4  errors=remount-ro,noatime,nodiratime  0 1
+# /dev/mmcblk0p1  /media/boot  vfat  defaults  0 0
+/dev/mmcblk0p1	/boot	ext2	errors=remount-ro,noatime,nodiratime	0 0
+tmpfs /tmp  tmpfs nodev,nosuid,mode=1777  0 0</code></pre>
+<p>We simply need to remove the MMC partitions and add a NAND one:</p>
+<pre class="file" data-filename="~/nandfs/fstab"><code>ubi0:nandroot  /  ubifs  defaults  0 1
+tmpfs /tmp  tmpfs nodev,nosuid,mode=1777  0 0</code></pre>
+<p>As for the boot script, we will base ours on <code>/boot/boot.cmd</code>. Here is the original file for reference:</p>
+<pre class="file" data-filename="boot.cmd"><code># default values
+setenv verbosity "8"
+setenv init_modem "yes"
+
+if test "${boot_device}" = "mmc"; then
+
+	setenv rootdev "/dev/mmcblk0p2"
+	setenv rootfstype "ext4"
+
+	if ext2load mmc 0:1 ${load_addr} armbianEnv.txt; then
+		env import -t ${load_addr} ${filesize}
+	fi
+
+	setenv bootargs "root=${rootdev} rootwait rootfstype=${rootfstype} console=ttyS0,921600 panic=10 consoleblank=0 loglevel=${verbosity} ${extraargs} ${extraboardargs}"
+
+	ext2load mmc 0:1 ${initrd_addr} uInitrd
+	ext2load mmc 0:1 ${kernel_addr} zImage
+	ext2load mmc 0:1 ${modem_addr} modem.bin
+else
+	echo "NAND boot is not implemented yet"
+fi
+
+if test "${init_modem}" = "yes"; then
+	mdcom_loadm ${modem_addr}
+	mdcom_check 1
+fi
+
+bootz ${kernel_addr} ${initrd_addr}
+
+# Recompile with:
+# mkimage -C none -A arm -T script -d /boot/boot.cmd /boot/boot.scr</code></pre>
+<p>We will use the same basic commands to boot. It is pointless to keep the <code>boot_device</code> switch and MMC boot code because this is a NAND-specific file living on a NAND partition using a NAND-specific version of the bootloader. (Anyone modifying the U-Boot source code to simultaneously support both MMC and NAND boot can also instruct it to use different filenames on the different devices.)</p>
+<p>Without the conditionals, <code>boot-nand.cmd</code> is much simpler:</p>
+<pre class="file" data-filename="boot-nand.cmd"><code>setenv ubiargs "ubi.mtd=1"
+setenv rootdev "ubi0:nandroot"
+setenv rootfstype "ubifs"
+
+setenv bootargs "${ubiargs} ${mtdparts} root=${rootdev} rootwait rootfstype=${rootfstype} console=ttyS0,921600 panic=10 consoleblank=0 loglevel=8 ${extraargs} ${extraboardargs}"
+
+ubifsload ${initrd_addr} "/boot/uInitrd"
+ubifsload ${kernel_addr} "/boot/zImage"
+ubifsload ${modem_addr} "/boot/modem.bin"
+
+mdcom_loadm ${modem_addr}
+mdcom_check 1
+
+bootz ${kernel_addr} ${initrd_addr}
+
+# Recompile with:
+# mkimage -C none -A arm -T script -d /boot/boot-nand.cmd /boot/boot-nand.scr</code></pre>
+<p>It instructs U-Boot to use ubifsload to load the images and additionally passes <code>ubi.mtd=1</code> and <code>mtdparts=...</code> to the kernel. Creating the compiled version, <code>boot-nand.scr</code>, is as simple as following the instructions in the file:</p>
+<pre class="shell cmd"><code>sudo mkimage -C none -A arm -T script -d /boot/boot-nand.cmd /boot/boot-nand.scr</code></pre>
+<p>And the boot script is ready.</p>
+<p>At this point, we need to run <code>mknandfs.sh</code> again to update the filesystem before taking its image:</p>
+<pre class="shell cmd"><code>sudo ~/nandfs/mknandfs.sh</code></pre>
+<p>Now that we have the filesystem ready, it's time to convert it into a UBIFS image. For this, we will use <code>mkfs.ubifs</code>. It is not the easiest tool to use, and it requires us to know some things about the UBI volume we are going to create and the memory it is going to reside on. (The FAQ has <a href="http://www.linux-mtd.infradead.org/faq/ubi.html#L_find_min_io_size">an entry</a> on these parameters, but it is also possible to determine them by creating an empty UBI volume and using the debug/info output of the tools involved in the process.)</p>
+<p>In our case, the logical eraseblock (LEB) size is 248 KiB, and the minimum I/O unit size is equal to the subpage size, 4 KiB. Specifying a maximum LEB count of 2000<a href="#fn8" class="footnoteRef" id="fnref8"><sup>8</sup></a> limits the filesystem to ~512 MiB. I've written another small shell script:</p>
+<pre class="code" data-filename="mkubifs.sh" data-language="bash"><code>#!/bin/bash
+set -euo pipefail
+set -x
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+DEST_ROOT="$SCRIPT_DIR"/nandroot
+DEST_FS_IMG="$SCRIPT_DIR"/nandroot.img
+MAX_LEB=2000
+
+mkfs.ubifs -e 248KiB -m 4096 -c $MAX_LEB -r "$DEST_ROOT" -o "$DEST_FS_IMG"</code></pre>
+<p>Let's run it:</p>
+<pre class="shell cmd"><code>sudo ~/nandfs/mkubifs.sh</code></pre>
+<pre class="shell out"><code>+++ readlink -f /home/orangepi/nandfs/mkubifs.sh
+++ dirname /home/orangepi/nandfs/mkubifs.sh
++ SCRIPT_DIR=/home/orangepi/nandfs
++ DEST_ROOT=/home/orangepi/nandfs/nandroot
++ DEST_FS_IMG=/home/orangepi/nandfs/nandroot.img
++ MAX_LEB=2000
++ mkfs.ubifs -e 248KiB -m 4096 -c 2000 -r /home/orangepi/nandfs/nandroot -o /home/orangepi/nandfs/nandroot.img</code></pre>
+<p>This creates the UBIFS image. Next, we will create the UBI image using <code>ubinize</code>. This command requires an image definition, given in an .ini file:</p>
+<pre class="file" data-filename="ubinize.ini"><code>[nandroot-volume]
+mode=ubi
+image=/home/orangepi/nandfs/nandroot.img
+vol_id=0
+vol_name=nandroot
+vol_size=480MiB
+vol_type=dynamic
+vol_alignment=1</code></pre>
+<p>You may have noticed that the volume size is 480 MiB. This is not only because the exact maximum size is hard to calculate, but also in case someone needs an extra volume in the future<a href="#fn9" class="footnoteRef" id="fnref9"><sup>9</sup></a>.</p>
+<p>In order to create the UBI image, we need to call <code>ubinize</code> with another set of parameters; this time the physical eraseblock (PEB) size in addition to the minimum I/O size. The PEB size is the page size of the NAND (256 KiB in our case) and the minimum I/O size is still the subpage size (4 KiB). Here is the third small shell script:</p>
+<pre class="file" data-filename="mkubi.sh" data-language="bash"><code>#!/bin/bash
+set -euo pipefail
+set -x
+
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+
+SRC="$SCRIPT_DIR"
+DEST_UBI_IMG="$SCRIPT_DIR"/ubi.img
+
+ubinize -p 256KiB -m 4096 "$SRC"/ubinize.ini -o "$DEST_UBI_IMG"</code></pre>
+<p>Let's call it:</p>
+<pre class="shell cmd"><code>sudo ~/nandfs/mkubi.sh</code></pre>
+<p>And the image should be ready at <code>~/nandfs/ubi.img</code>. I suggest using <code>rsync -P</code> to get it off the device as the device's Wi-Fi is not very stable.</p>
+<h3 id="the-bootloader">The Bootloader</h3>
+<p>The official bootloader is <a href="http://www.denx.de/wiki/U-Boot/">U-Boot</a> and that is what we will be using. <i>Orange Pi</i> released their modified source code in the "Android SDK" download and there is a <a href="https://github.com/RDA8810/u-boot-RDA8810">repository</a> at GitHub. We will be using <a href="https://github.com/aib/u-boot-RDA8810">my fork</a> which has NAND-boot- and NAND-flashing-specific improvements.</p>
+<p>We will need to build the bootloader using an ARM GCC toolchain. It is possible to do this on the device itself, but it will be much faster to cross-compile on a PC. Unless your PC is a compatible ARM, you will most likely need to set the <code>CROSS_COMPILE</code> variable. This variable prefixes every gcc/binutils command, so if your cross-compiler is called <code>arm-none-eabi-gcc</code>, you will need to set <code>CROSS_COMPILE=arm-none-eabi-</code>. Please install an ARM GCC toolchain and determine your own prefix. I use the Debian package <code>gcc-arm-none-eabi</code> and the prefix seen below.</p>
+<p>Let's clone the U-Boot fork, cd to it and change to the <code>nand-boot</code> branch:</p>
+<pre class="shell cmd"><code>git clone https://github.com/aib/u-boot-RDA8810.git</code></pre>
+<pre class="shell out" data-ellipsis="..."><code>Cloning into 'u-boot-RDA8810'...</code></pre>
+<pre class="shell cmd"><code>cd u-boot-RDA8810</code></pre>
+<pre class="shell cmd"><code>git checkout nand-boot</code></pre>
+<pre class="shell out"><code>Branch nand-boot set up to track remote branch nand-boot from origin.
+Switched to a new branch 'nand-boot'</code></pre>
+<p>If you are using a custom partition table, this is the time to bake it into the source. See the file <code>include_rda/tgt_ap_flash_parts.h</code>.</p>
+<p>Let's build the PDL binaries first:</p>
+<pre class="shell cmd"><code>make CROSS_COMPILE=arm-none-eabi- clean rda8810_config</code></pre>
+<pre class="shell out"><code>Configuring for rda8810 board...</code></pre>
+<pre class="shell cmd"><code>make CROSS_COMPILE=arm-none-eabi- pdl=1 PDL</code></pre>
+<p>Save the files <code>pdl1.bin</code> and <code>pdl2.bin</code>; they will not survive the next build.</p>
+<p>Next, build the bootloader itself:</p>
+<pre class="shell cmd"><code>make CROSS_COMPILE=arm-none-eabi- clean rda8810_config</code></pre>
+<pre class="shell out"><code>Configuring for rda8810 board...</code></pre>
+<pre class="shell cmd"><code>make CROSS_COMPILE=arm-none-eabi- </code></pre>
+<p>And obtain <code>u-boot.rda</code>.</p>
+<p>Finally, we can go on to...</p>
+<h3 id="the-flashing">The Flashing</h3>
+<p>By now you should have <code>ubi.img</code>, <code>pdl1.bin</code>, <code>pdl2.bin</code> and <code>u-boot.rda</code>. Get my flashing script either <a href="https://raw.githubusercontent.com/aib/opi2g-utils/master/opi2g_nand_write.py">directly</a> or by cloning its <a href="https://github.com/aib/opi2g-utils.git">repository</a>.</p>
+<p>Make sure the boot device selector jumper is in the NAND position and put your Orange Pi into OTG/recovery mode by powering it up with the button depressed<a href="#fn10" class="footnoteRef" id="fnref10"><sup>10</sup></a>. (DIP switch #1 may also need to be in the ON position.) The Orange Pi should identify itself as a USB HID CDC ACM device and your system should assign it a device node, probably <code>/dev/ttyACM0</code>. With all the files in the same directory, run:</p>
+<pre class="shell cmd"><code>python3 opi2g_nand_write.py -p /dev/ttyACM0 --format-flash --pdl1 pdl1.bin --pdl2 pdl2.bin bootloader:u-boot.rda nandroot:ubi.img</code></pre>
+<pre class="shell out"><code>Opening /dev/ttyACM0...
+Sending partition pdl1 (len #) to 0x00100100
+Sending partition pdl2 (len #) to 0x80008000
+Partition table: mtdparts=rda_nand:2M@128K(bootloader),2M(factorydata),2M(misc),4M(modem),8M(boot),10M(recovery),300M(system),300M(vendor),-(userdata)
+Formatting flash memory...
+Partition table: mtdparts=rda_nand:2M(bootloader),510M(nandroot)
+Sending partition bootloader (len #) to 0x00000000
+Sending partition nandroot (len #) to 0x00000000
+Done</code></pre>
+<p>Reboot, and your Orange Pi 2G-IOT should now boot from NAND!</p>
+<div class="footnotes">
+<hr>
+<ol>
+<li id="fn1"><p>I have to admit at this point that I have no idea what "PDL" stands for.<a href="#fnref1">‚Ü©</a></p></li>
+<li id="fn2"><p><code>mtdparts</code> is documented at <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Documentation/block/cmdline-partition.txt">Documentation/block/cmdline-partition.txt</a>.<a href="#fnref2">‚Ü©</a></p></li>
+<li id="fn3"><p>I know the stock partition table starts at 128K. I try not to worry about it too much.<a href="#fnref3">‚Ü©</a></p></li>
+<li id="fn4"><p>The website says "500MB". U-Boot says 512 MiB, but is only able to read the first 511 MiB.<a href="#fnref4">‚Ü©</a></p></li>
+<li id="fn5"><p>Known as "wear leveling". <a href="https://en.wikipedia.org/wiki/Wear_leveling">Wikipedia article</a>.<a href="#fnref5">‚Ü©</a></p></li>
+<li id="fn6"><p>FAQs: <a href="http://www.linux-mtd.infradead.org/faq/general.html">MTD</a>, <a href="http://www.linux-mtd.infradead.org/faq/ubi.html">UBI</a>, <a href="http://www.linux-mtd.infradead.org/faq/ubifs.html">UBIFS</a>.<a href="#fnref6">‚Ü©</a></p></li>
+<li id="fn7"><p>Tip: <code>ncdu</code> is an excellent utility.<a href="#fnref7">‚Ü©</a></p></li>
+<li id="fn8"><p>This parameter specifies the maximum size the filesystem can take, given a larger volume.<a href="#fnref8">‚Ü©</a></p></li>
+<li id="fn9"><p>Say, you decide to make the root filesystem read-only and use a small read-write partition for logs.<a href="#fnref9">‚Ü©</a></p></li>
+<li id="fn10"><p>For non-native speakers: This just means "pressed".<a href="#fnref10">‚Ü©</a></p></li>
+</ol>
+</div>
+
+
+</body></html>Ytext/htmlUUTF-8_1https://www.aib42.net/article/hacking-orangepi-2gP°‘_WebResourceResponseOêheader {
+	text-align: center;
+}
+
+.title {
+	display: inline;
+}
+
+.author {
+	display: none;
+}
+
+.date {
+	float: right;
+	font-size: 80%;
+}
+
+code {
+	font-weight: bold;
+	white-space: pre-wrap;
+	tab-size: 4; -moz-tab-size: 4; -o-tab-size: 4;
+}
+
+.file[data-filename]::before, .code[data-filename]::before {
+	font-weight: bold;
+	color: #066;
+	content: "File: "attr(data-filename)"\a\a";
+}
+.code, .shell, .file, .literal {
+	display: table;
+	border: 1px solid #ccc;
+	background: #eee;
+	padding: 4px;
+	margin-bottom: 1px;
+	margin-top: 1px;
+}
+
+.shell {
+}
+
+.shell.cmd::before {
+	font-weight: bold;
+	content: attr(data-cwd)"$ ";
+}
+.shell.cmd {
+	color: #006;
+	border-radius: 5px;
+}
+
+.shell.out {
+	color: #060;
+}
+.shell.out::after {
+	font-weight: bold;
+	color: #066;
+	content: "\a"attr(data-ellipsis);
+}
+.shell.out:not([data-ellipsis])::after {
+	content: none;
+}
+
+.file {
+	color: #333;
+}
+
+.literal {
+	color: #333;
+	border: 0px;
+}
+Xtext/cssOßbplist00‘fgX$versionX$objectsY$archiverT$top Ü†Ø#)*0123KLMNOPQRSTUVWXYZ[\]aU$null›	
+ !"___nsurlrequest_proto_prop_obj_6___nsurlrequest_proto_prop_obj_3R$2___nsurlrequest_proto_prop_obj_0R$3___nsurlrequest_proto_prop_obj_4V$class___nsurlrequest_proto_prop_obj_1R$4R$0___nsurlrequest_proto_prop_obj_5___nsurlrequest_proto_prop_obj_2R$1ÄÄÄ	ÄÄÄÄ Ä”$% '(WNS.base[NS.relativeÄ ÄÄ_$https://www.aib42.net/css/pandoc.css“+,-.Z$classnameX$classesUNSURL¢-/XNSObject#A¡YÊgÆÆ »”456@JWNS.keysZNS.objects©789:;<=>?Ä	Ä
+ÄÄÄÄÄÄÄ©ACDEFGHIÄÄÄÄÄÄÄÄÄÄVServer\Content-TypeTEtag]Last-ModifiedX__hhaa__TDate]Accept-Ranges^Content-LengthZConnection_nginx/1.14.0 (Ubuntu)Xtext/css^"5cbdc250-390"_Mon, 22 Apr 2019 13:32:00 GMT_Ã
+
+YnBsaXN0MDDYAQIDBAUGBwgJCw0PERMVF1pDb25uZWN0aW9uVlNlcnZlclxDb250ZW50LVR5cGVdTGFzdC1Nb2RpZmllZF1BY2NlcHQtUmFuZ2VzVERhdGVeQ29udGVudC1MZW5ndGhURXRhZ6EKWmtlZXAtYWxpdmWhDF8QFW5naW54LzEuMTQuMCAoVWJ1bnR1KaEOWHRleHQvY3NzoRBfEB1Nb24sIDIyIEFwciAyMDE5IDEzOjMyOjAwIEdNVKESVWJ5dGVzoRRfEB1UdWUsIDExIEp1biAyMDE5IDE0OjI5OjMzIEdNVKEWUzkxMqEYXiI1Y2JkYzI1MC0zOTAiAAgAGQAkACsAOABGAFQAWQBoAG0AbwB6AHwAlACWAJ8AoQDBAMMAyQDLAOsA7QDxAPMAAAAAAAACAQAAAAAAAAAZAAAAAAAAAAAAAAAAAAABAg==_Tue, 11 Jun 2019 14:29:33 GMTUbytesS912Zkeep-alive“+,^__NSMutableDictionary£^`/\NSDictionary“+,bc_NSHTTPURLResponse£de/_NSHTTPURLResponse]NSURLResponse_NSKeyedArchiver—hi_WebResourceResponseÄ    # - 2 7 W ] x ö º ø · ‰/25Wy|~ÄÇÑÜàäåçèëìïú§∞≤¥∂›‚Ìˆ¸ˇ$/9;=?ACEGIKUWY[]_acegip}Çêôû¨ª∆ﬁÁˆÊ 6:GL`dxÜòõ±             j              ≥_$https://www.aib42.net/css/pandoc.css    1 < N d Ç ë ®N∑N¡N«N˚N¸N˛OOR±R∫Ye                           Yå
